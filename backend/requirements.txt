@@ -1,0 +1,4 @@
+browser-use
+fastapi
+uvicorn
+python-dotenv

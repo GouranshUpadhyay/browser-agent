@@ -1,0 +1,134 @@
+"""
+Runs the Browser-Use agent for one goal and returns a clean, structured result.
+
+Why this file looks the way it does:
+- On Windows, uvicorn's event loop cannot launch Chrome (NotImplementedError).
+  So the agent runs in its own thread with its own Proactor loop.
+- The agent is asked to answer in JSON so the frontend can show nice cards
+  with real links. If it answers in plain text anyway, we fall back to that.
+"""
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import asyncio
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+from browser_use import Agent, ChatGoogle
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+JSON_INSTRUCTIONS = """
+
+RULES FOR YOUR FINAL ANSWER:
+- Only report information EXACTLY as shown on the pages you visited. Never guess or estimate.
+- When you are finished, call done with ONLY a JSON object (no markdown, no code fences) in this shape:
+{"summary": "1-3 sentence answer to the goal",
+ "items": [{"title": "...", "price": "... or null", "details": "short specs/notes or null", "url": "full https link to that item/page", "source": "site name"}]}
+- Use real, full URLs that you actually saw. If an item has no link, use null.
+- If the goal is a simple question, "items" may be an empty list and "summary" holds the answer.
+"""
+
+
+def _get_api_key():
+    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    return key.strip() if key else None
+
+
+def parse_answer(raw: str) -> dict:
+    """Turn the agent's final text into {summary, items}. Never raises."""
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            items = []
+            for it in data.get("items") or []:
+                if isinstance(it, dict):
+                    items.append(
+                        {
+                            "title": str(it.get("title") or "Untitled"),
+                            "price": it.get("price"),
+                            "details": it.get("details"),
+                            "url": it.get("url") if str(it.get("url") or "").startswith("http") else None,
+                            "source": it.get("source"),
+                        }
+                    )
+            return {"summary": str(data.get("summary") or ""), "items": items}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    # Fallback: the model answered in plain text
+    return {"summary": text, "items": []}
+
+
+def friendly_error(raw: str) -> str:
+    low = (raw or "").lower()
+    if "429" in low or "resource_exhausted" in low or "quota" in low:
+        return "The free Gemini quota for this model is used up for now. Wait a bit (or until tomorrow), or set GEMINI_MODEL in backend/.env to another model."
+    if "404" in low and "model" in low:
+        return "This Gemini model name is no longer available. Set GEMINI_MODEL in backend/.env to a current model name."
+    if "api key" in low or "api_key" in low or "permission_denied" in low or "401" in low or "403" in low:
+        return "The Gemini API key is missing or invalid. Check GOOGLE_API_KEY in backend/.env."
+    return raw or "Unknown error"
+
+
+def _sources(history) -> list:
+    out, seen = [], set()
+    try:
+        urls = history.urls() or []
+    except Exception:
+        urls = []
+    for u in urls:
+        if not u or not str(u).startswith("http") or u in seen:
+            continue
+        seen.add(u)
+        out.append({"url": u, "domain": urlparse(u).netloc.replace("www.", "")})
+    return out
+
+
+async def _run(goal: str, max_steps: int) -> dict:
+    api_key = _get_api_key()
+    if not api_key:
+        return {"success": False, "error": "No API key found. Put GOOGLE_API_KEY=... inside backend/.env and restart the server.", "summary": "", "items": [], "sources": []}
+
+    llm = ChatGoogle(model=MODEL, api_key=api_key)
+    agent = Agent(
+        task=goal + JSON_INSTRUCTIONS,
+        llm=llm,
+        max_steps=max_steps,
+        enable_signal_handler=False,  # we run inside a worker thread
+    )
+
+    try:
+        history = await agent.run()
+    except Exception as e:  # str(e) can be empty, so fall back to repr
+        return {"success": False, "error": friendly_error(str(e) or repr(e)), "summary": "", "items": [], "sources": []}
+
+    final = history.final_result()
+    sources = _sources(history)
+
+    if not final:
+        errs = [str(e) for e in (history.errors() or []) if e]
+        reason = friendly_error(errs[-1]) if errs else "The agent stopped without giving an answer. Try a more specific goal."
+        return {"success": False, "error": reason, "summary": "", "items": [], "sources": sources}
+
+    parsed = parse_answer(final)
+    return {"success": True, "error": None, "sources": sources, **parsed}
+
+
+def _run_in_own_loop(goal: str, max_steps: int) -> dict:
+    loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_run(goal, max_steps))
+    finally:
+        loop.close()
+
+
+async def run_agent_task(goal: str, max_steps: int = 25) -> dict:
+    return await asyncio.to_thread(_run_in_own_loop, goal, max_steps)
