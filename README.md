@@ -13,6 +13,12 @@ Terminal 2:  `cd frontend` then  `npm run dev`   -> open http://localhost:5173
 The pill at the top of the page tells you the status:
 green = ready, yellow = key missing (.env problem), red = backend not running.
 
+## Live progress
+The page calls `POST /run/stream`, which streams real agent events (Server-Sent Events) while it works:
+`run_started` → `step_started` / `step_planned` / `step_finished` per step → `finalizing` → `result`.
+These drive the execution graph next to the input box and the activity timeline under each goal.
+Pressing Stop closes the stream, which stops the agent before its next step. `POST /run` still returns the result in one response.
+
 ## Test the agent without the frontend
 `cd backend` then `python test_agent.py "Go to wikipedia.org and tell me the height of Mount Everest"`
 

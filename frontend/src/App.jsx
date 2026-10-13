@@ -1,5 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import './App.css'
+import ActivityTimeline from './ActivityTimeline'
+import ExecutionGraph from './ExecutionGraph'
+import { applyEvent, finish, newRun, streamRun } from './agentRun'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -9,21 +12,19 @@ const EXAMPLES = [
   "Search Google for 'wireless mouse' and list the top 3 results",
 ]
 
-const PROGRESS = [
-  'Opening a real browser…',
-  'Reading the page…',
-  'Deciding the next click…',
-  'Collecting details…',
-  'Double-checking what it found…',
-]
-
 export default function App() {
   const [goal, setGoal] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [elapsed, setElapsed] = useState(0)
-  const [data, setData] = useState(null)
+  const [turns, setTurns] = useState([]) // [{ id, run }]
   const [backend, setBackend] = useState('checking')
-  const timer = useRef(null)
+  const [now, setNow] = useState(Date.now())
+  const abortRef = useRef(null)
+  const threadRef = useRef(null)
+  const stickRef = useRef(true)
+  const inputRef = useRef(null)
+  const nextId = useRef(1)
+
+  const latest = turns[turns.length - 1]?.run
+  const loading = latest?.status === 'connecting' || latest?.status === 'running'
 
   useEffect(() => {
     fetch(`${API}/health`)
@@ -32,39 +33,75 @@ export default function App() {
       .catch(() => setBackend('offline'))
   }, [])
 
-  useEffect(() => () => clearInterval(timer.current), [])
+  // Real wall-clock time for the elapsed counters while a run is live
+  useEffect(() => {
+    if (!loading) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [loading])
+
+  useEffect(() => () => abortRef.current?.abort(), [])
+
+  // Follow new activity, unless the user has scrolled up to read something
+  useLayoutEffect(() => {
+    const el = threadRef.current
+    if (el && stickRef.current) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+  }, [turns])
+
+  const onScroll = () => {
+    const el = threadRef.current
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+  }
+
+  const updateRun = useCallback((id, fn) => {
+    setTurns((ts) => ts.map((t) => (t.id === id ? { ...t, run: fn(t.run) } : t)))
+  }, [])
 
   const run = async () => {
-    if (goal.trim().length < 3 || loading) return
-    setLoading(true)
-    setData(null)
-    setElapsed(0)
-    timer.current = setInterval(() => setElapsed((s) => s + 1), 1000)
+    const text = goal.trim()
+    if (text.length < 3 || loading) return
+    const id = nextId.current++
+    const controller = new AbortController()
+    abortRef.current = controller
+    stickRef.current = true
+    setNow(Date.now())
+    setTurns((ts) => [...ts, { id, run: newRun(text) }])
+    setGoal('')
+
     try {
-      const res = await fetch(`${API}/run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal }),
+      await streamRun(API, text, {
+        signal: controller.signal,
+        onEvent: (ev) => updateRun(id, (r) => applyEvent(r, ev)),
       })
-      if (!res.ok) throw new Error(`Server returned ${res.status}`)
-      setData(await res.json())
       setBackend('ready')
     } catch (err) {
-      setBackend('offline')
-      setData({
-        success: false,
-        error: `Could not reach the backend (${err.message}). Is it running on ${API}?`,
-        items: [],
-        sources: [],
-      })
+      if (controller.signal.aborted) {
+        updateRun(id, (r) => finish(r, 'stopped', { success: false, error: 'You stopped this run.', items: [], sources: [] }))
+      } else {
+        setBackend('offline')
+        updateRun(id, (r) =>
+          finish(r, 'failed', {
+            success: false,
+            error: `Could not reach the backend (${err.message}). Is it running on ${API}?`,
+            items: [],
+            sources: [],
+          }),
+        )
+      }
     } finally {
-      clearInterval(timer.current)
-      setLoading(false)
+      abortRef.current = null
+      setNow(Date.now())
+      inputRef.current?.focus()
     }
   }
 
+  const stop = () => abortRef.current?.abort()
+
   const onKey = (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run()
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      run()
+    }
   }
 
   const badge = {
@@ -75,56 +112,96 @@ export default function App() {
   }[backend]
 
   return (
-    <div className="page">
-      <header className="hero">
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          Browser <span>Agent</span>
+        </div>
         <span className={`pill ${badge[0]}`}><i /> {badge[1]}</span>
-        <h1>Browser <span>Agent</span></h1>
-        <p>Tell it what you need. It opens a real browser, browses on its own, and brings back results with links.</p>
       </header>
 
-      <section className="card input-card">
-        <textarea
-          value={goal}
-          onChange={(e) => setGoal(e.target.value)}
-          onKeyDown={onKey}
-          placeholder="e.g. Find 3 laptops under 60000 rupees on Flipkart"
-          rows={3}
-          disabled={loading}
-        />
-        <div className="row">
-          <div className="chips">
-            {EXAMPLES.map((ex) => (
-              <button key={ex} className="chip" onClick={() => setGoal(ex)} disabled={loading}>
-                {ex}
-              </button>
-            ))}
-          </div>
-          <button className="run" onClick={run} disabled={loading || goal.trim().length < 3}>
-            {loading ? 'Working…' : 'Run agent'}
-          </button>
+      <main className="thread" ref={threadRef} onScroll={onScroll}>
+        <div className="thread-inner">
+          {turns.length === 0 ? (
+            <section className="hero">
+              <h1>Browser <span>Agent</span></h1>
+              <p>Tell it what you need. It opens a real browser, browses on its own, and brings back results with links.</p>
+              <div className="chips">
+                {EXAMPLES.map((ex) => (
+                  <button
+                    key={ex}
+                    className="chip"
+                    onClick={() => {
+                      setGoal(ex)
+                      inputRef.current?.focus()
+                    }}
+                  >
+                    {ex}
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : (
+            turns.map(({ id, run: r }) => <Turn key={id} run={r} now={now} />)
+          )}
         </div>
-      </section>
+      </main>
 
-      {loading && (
-        <section className="card loading">
-          <div className="spinner" />
-          <div>
-            <strong>{PROGRESS[Math.floor(elapsed / 6) % PROGRESS.length]}</strong>
-            <p>{elapsed}s elapsed · a browser window will open on the server — this usually takes 1–3 minutes.</p>
+      <div className="dock">
+        <section className="composer card">
+          <div className="composer-input">
+            <textarea
+              ref={inputRef}
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              onKeyDown={onKey}
+              placeholder="e.g. Find 3 laptops under 60000 rupees on Flipkart"
+              rows={2}
+              disabled={loading}
+              aria-label="Goal for the agent"
+            />
+            <div className="composer-row">
+              <span className="hint">Enter to run · Shift+Enter for a new line</span>
+              {loading ? (
+                <button className="run stop" onClick={stop}>Stop</button>
+              ) : (
+                <button className="run" onClick={run} disabled={goal.trim().length < 3}>Run agent</button>
+              )}
+            </div>
           </div>
+          <ExecutionGraph run={latest} now={now} />
         </section>
-      )}
-
-      {data && !loading && (data.success ? <Results data={data} /> : <ErrorCard message={data.error} />)}
-
-      <footer>Results come straight from the pages the agent visited. Always open the link to confirm important details.</footer>
+        <footer>Results come straight from the pages the agent visited. Always open the link to confirm important details.</footer>
+      </div>
     </div>
+  )
+}
+
+function Turn({ run, now }) {
+  const ended = run.result && run.status !== 'connecting' && run.status !== 'running'
+  return (
+    <article className="turn">
+      <div className="bubble">{run.goal}</div>
+      <ActivityTimeline run={run} now={now} />
+      {ended && (run.result.success ? <Results data={run.result} /> : <ErrorCard message={run.result.error} stopped={run.status === 'stopped'} />)}
+    </article>
   )
 }
 
 function Results({ data }) {
   return (
     <section className="results">
+      {data.verified === false && (
+        <div className="card warning">
+          <h2>Could not verify these results</h2>
+          <p>
+            {data.warning ||
+              "The agent's own check found that some of these details may not match the pages it visited."}{' '}
+            Open the links to confirm, or run the goal again.
+          </p>
+        </div>
+      )}
+
       {data.summary && (
         <div className="card summary">
           <h2>Answer</h2>
@@ -172,10 +249,10 @@ function Results({ data }) {
   )
 }
 
-function ErrorCard({ message }) {
+function ErrorCard({ message, stopped }) {
   return (
-    <section className="card error">
-      <h2>That didn't work</h2>
+    <section className={`card error ${stopped ? 'muted' : ''}`}>
+      <h2>{stopped ? 'Stopped' : "That didn't work"}</h2>
       <p>{message}</p>
     </section>
   )
