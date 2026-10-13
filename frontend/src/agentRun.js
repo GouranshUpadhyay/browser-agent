@@ -31,11 +31,13 @@ const ACTION_LABELS = {
 
 export const actionLabel = (name) => ACTION_LABELS[name] || name.replace(/_/g, ' ')
 
-export function newRun(goal) {
+// A run as the UI sees it. `id` is the server's run id (null until the server accepts it).
+export function newRun(goal, { id = null, createdAt = null } = {}) {
   return {
+    id,
     goal,
     status: 'connecting', // connecting | running | done | failed | stopped
-    startedAt: Date.now(),
+    startedAt: createdAt ? Date.parse(createdAt) : Date.now(),
     endedAt: null,
     maxSteps: null,
     steps: [], // { step, status: thinking|acting|done|failed, goal, url, title, actions, errors }
@@ -65,7 +67,7 @@ function updateLastStep(run, patch) {
 export function applyEvent(run, ev) {
   switch (ev.type) {
     case 'run_started':
-      return { ...run, status: 'running', maxSteps: ev.max_steps }
+      return { ...run, status: 'running', maxSteps: ev.max_steps, startedAt: ev.ts || run.startedAt }
     case 'step_started':
       return {
         ...run,
@@ -87,20 +89,20 @@ export function applyEvent(run, ev) {
     case 'finalizing':
       return { ...run, finalizing: true }
     case 'result':
-      return finish(run, ev.success ? 'done' : 'failed', ev)
+      return finish(run, ev.status || (ev.success ? 'done' : 'failed'), ev, ev.ts)
     default:
       return run
   }
 }
 
 // Ends the run. On failure, the stage that was running is the one marked as failed.
-export function finish(run, status, result) {
+export function finish(run, status, result, endedAt = Date.now()) {
   if (!isLive(run)) return run
   const failedNode = status === 'done' ? null : activeNode(run)
   const steps = run.steps.map((s) =>
     s.status === 'thinking' || s.status === 'acting' ? { ...s, status: status === 'done' ? 'done' : 'failed' } : s,
   )
-  return { ...run, status, steps, failedNode, endedAt: Date.now(), result }
+  return { ...run, status, steps, failedNode, endedAt, result }
 }
 
 // idle | running | done | failed | stopped for each graph node
@@ -134,37 +136,7 @@ export function domainOf(url) {
   }
 }
 
-// POSTs the goal and calls onEvent for every Server-Sent Event until the final "result".
-export async function streamRun(api, goal, { signal, onEvent }) {
-  const res = await fetch(`${api}/run/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ goal }),
-    signal,
-  })
-  if (!res.ok || !res.body) throw new Error(`Server returned ${res.status}`)
-
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
-  let buffer = ''
-  let gotResult = false
-  for (;;) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += value.replace(/\r\n/g, '\n')
-    let cut
-    while ((cut = buffer.indexOf('\n\n')) !== -1) {
-      const block = buffer.slice(0, cut)
-      buffer = buffer.slice(cut + 2)
-      const data = block
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n')
-      if (!data) continue
-      const event = JSON.parse(data)
-      if (event.type === 'result') gotResult = true
-      onEvent(event)
-    }
-  }
-  if (!gotResult) throw new Error('The connection closed before the agent finished')
+// Rebuilds a run from its stored events (history, page refresh, a link from a notification).
+export function runFromEvents(summary, events) {
+  return events.reduce(applyEvent, newRun(summary.goal, { id: summary.id, createdAt: summary.created_at }))
 }

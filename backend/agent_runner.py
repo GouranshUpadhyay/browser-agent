@@ -7,26 +7,29 @@ Why this file looks the way it does:
 - The agent is asked to answer in JSON so the frontend can show nice cards
   with real links. If it answers in plain text anyway, we fall back to that.
 - Live progress: browser-use hooks (step start / model decision / step end)
-  are turned into small event dicts and handed to an `emit` callback, which
-  the streaming endpoint forwards to the browser as Server-Sent Events.
+  are turned into small event dicts and handed to an `emit` callback; the run
+  manager stores them so the UI can stream (and re-stream) them.
+- Safety: the agent browses the public web only. It cannot run page JavaScript
+  or upload files, cannot open IP addresses or local hosts, and can be limited
+  to ALLOWED_DOMAINS.
 """
-from dotenv import load_dotenv
-
-load_dotenv()
-
 import asyncio
 import json
-import os
 import re
 import sys
-import threading
 from collections.abc import Callable
 from urllib.parse import urlparse
 
-from browser_use import Agent, ChatGoogle
+from browser_use import Agent, BrowserProfile, ChatGoogle, Tools
 from pydantic import BaseModel, Field
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+import config
+
+MODEL = config.MODEL
+
+# Actions the agent never needs for research and that widen what a malicious page could make it do
+EXCLUDED_ACTIONS = ["evaluate", "upload_file"]
+PROHIBITED_DOMAINS = ["localhost", "*.localhost", "*.local", "*.internal"]
 
 
 class AnswerItem(BaseModel):
@@ -60,8 +63,7 @@ RULES FOR YOUR FINAL ANSWER:
 
 
 def _get_api_key():
-    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    return key.strip() if key else None
+    return config.api_key()
 
 
 def parse_answer(raw: str) -> dict:
@@ -202,6 +204,12 @@ async def _run(goal: str, max_steps: int, emit: Emit, should_stop: Callable[[], 
         llm=llm,
         max_steps=max_steps,
         enable_signal_handler=False,  # we run inside a worker thread
+        browser_profile=BrowserProfile(
+            block_ip_addresses=True,
+            allowed_domains=config.ALLOWED_DOMAINS,
+            prohibited_domains=PROHIBITED_DOMAINS,
+        ),
+        tools=Tools(exclude_actions=EXCLUDED_ACTIONS),
         register_new_step_callback=on_decision,
         register_should_stop_callback=stop_requested,
         output_model_schema=AgentAnswer,
@@ -231,48 +239,17 @@ async def _run(goal: str, max_steps: int, emit: Emit, should_stop: Callable[[], 
     return {"success": True, "error": None, "sources": sources, "verified": verified, "warning": warning, **parsed}
 
 
-def _run_in_own_loop(goal: str, max_steps: int, emit: Emit, should_stop: Callable[[], bool]) -> dict:
+def execute(goal: str, max_steps: int, emit: Emit, should_stop: Callable[[], bool]) -> dict:
+    """Run one goal to completion in the calling thread, on its own event loop. Never raises."""
     loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(_run(goal, max_steps, emit, should_stop))
+    except Exception as e:
+        return {"success": False, "error": friendly_error(str(e) or repr(e)), "summary": "", "items": [], "sources": []}
     finally:
         loop.close()
 
 
-async def run_agent_task(goal: str, max_steps: int = 25) -> dict:
-    return await asyncio.to_thread(_run_in_own_loop, goal, max_steps, lambda _event: None, lambda: False)
-
-
-async def stream_agent_task(goal: str, max_steps: int = 25):
-    """Yield live event dicts while the agent works; the last one is {"type": "result", ...}.
-
-    Closing the generator early (client disconnected / pressed Stop) asks the agent to stop.
-    """
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    stop = threading.Event()
-
-    def emit(event: dict) -> None:  # called from the agent's thread
-        loop.call_soon_threadsafe(queue.put_nowait, event)
-
-    async def worker():
-        try:
-            result = await asyncio.to_thread(_run_in_own_loop, goal, max_steps, emit, stop.is_set)
-        except Exception as e:
-            result = {"success": False, "error": friendly_error(str(e) or repr(e)), "summary": "", "items": [], "sources": []}
-        queue.put_nowait({"type": "result", **result})
-
-    yield {"type": "run_started", "goal": goal, "max_steps": max_steps, "model": MODEL}
-    task = asyncio.create_task(worker())
-    try:
-        while True:
-            event = await queue.get()
-            yield event
-            if event["type"] == "result":
-                break
-    finally:
-        # No-op if the run already finished; otherwise the agent halts before its next step
-        # and the worker thread closes its browser in the background.
-        stop.set()
-        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+async def run_agent_task(goal: str, max_steps: int = config.MAX_STEPS) -> dict:
+    return await asyncio.to_thread(execute, goal, max_steps, lambda _event: None, lambda: False)

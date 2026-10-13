@@ -2,3 +2,7 @@ browser-use
 fastapi
 uvicorn
 python-dotenv
+sqlalchemy>=2.0
+croniter
+tzdata
+httpx
